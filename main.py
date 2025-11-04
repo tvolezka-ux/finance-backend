@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI
 import asyncio
 
 
@@ -81,11 +82,15 @@ async def send_message_to_user(user_id: int, text: str):
 
 # ===================== FastAPI =====================
 app = FastAPI()
+origins = [
+    "https://frontend-nine-phi-39.vercel.app",  # твой фронт
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://frontend-nine-phi-39.vercel.app/"],  # на dev можно *, потом лучше указать фронтенд URL
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=origins,          # Разрешённые источники
+    allow_credentials=True,
+    allow_methods=["*"],            # Разрешаем все методы (GET, POST, OPTIONS и т.п.)
+    allow_headers=["*"],            # Разрешаем все заголовки
 )
 
 class AddRecordRequest(BaseModel):
