@@ -148,6 +148,24 @@ async def api_report(period: str = "day", user_id: int = None):
     expense = sum(r[1] for r in rows if r[0] == "expense")
     return {"period_label": label, "income": income or 0.0, "expense": expense or 0.0, "data": rows}
 
+@app.get("/api/records")
+async def api_records(user_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT id, type, amount, created_at FROM finance WHERE user_id = ? ORDER BY datetime(created_at) DESC LIMIT 50", (user_id,))
+    rows = [{"id": r[0], "type": r[1], "amount": r[2], "created_at": r[3]} for r in c.fetchall()]
+    conn.close()
+    return rows
+
+@app.put("/api/update/{record_id}")
+async def api_update(record_id: int, data: dict):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE finance SET amount = ? WHERE id = ?", (data["amount"], record_id))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
