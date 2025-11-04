@@ -2,7 +2,7 @@
 import os
 import sqlite3
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,15 +22,26 @@ if not BOT_TOKEN:
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS finance (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        type TEXT,
-        amount REAL,
-        description TEXT,
-        category_id INTEGER,
-        created_at TEXT
-    );""")
+    # Таблица операций
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS finance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            type TEXT,
+            amount REAL,
+            description TEXT,
+            category_id INTEGER,
+            created_at TEXT
+        );
+    """)
+    # Таблица настроек пользователя
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id INTEGER PRIMARY KEY,
+            currency TEXT DEFAULT '₽',
+            start_balance REAL DEFAULT 0
+        );
+    """)
     conn.commit()
     conn.close()
 
@@ -76,6 +87,35 @@ class UpdateRecordRequest(BaseModel):
 def get_conn():
     return sqlite3.connect(DB_PATH)
 
+# ====== Эндпоинты настроек пользователя ======
+@app.post("/api/init_user")
+async def api_init_user(data: dict = Body(...)):
+    user_id = data.get("user_id")
+    currency = data.get("currency", "₽")
+    start_balance = float(data.get("start_balance", 0))
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        INSERT OR REPLACE INTO user_settings (user_id, currency, start_balance)
+        VALUES (?, ?, ?)
+    """, (user_id, currency, start_balance))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+
+@app.get("/api/get_user")
+async def api_get_user(user_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT currency, start_balance FROM user_settings WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {"currency": row[0], "start_balance": row[1]}
+    return {"currency": "₽", "start_balance": 0}
+
 # ===== Добавить операцию =====
 @app.post("/api/add")
 async def api_add(record: AddRecordRequest):
@@ -84,7 +124,8 @@ async def api_add(record: AddRecordRequest):
     c.execute("""
         INSERT INTO finance (user_id, type, amount, description, category_id, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
-    """, (record.user_id, record.type, record.amount, record.description, record.category_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    """, (record.user_id, record.type, record.amount, record.description, record.category_id,
+          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
     conn.close()
 
@@ -132,7 +173,7 @@ async def api_report(period: str = "day", user_id: int = None):
     else:
         start = now - timedelta(days=365)
         label = f"{(now - timedelta(days=365)).strftime('%d.%m.%Y')} — {now.strftime('%d.%m.%Y')}"
-
+    
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
@@ -142,11 +183,26 @@ async def api_report(period: str = "day", user_id: int = None):
         GROUP BY type
     """, (user_id, start.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")))
     rows = c.fetchall()
+
+    # Получаем стартовый баланс пользователя
+    c.execute("SELECT start_balance FROM user_settings WHERE user_id = ?", (user_id,))
+    start_balance_row = c.fetchone()
+    start_balance = start_balance_row[0] if start_balance_row else 0
+
     conn.close()
 
     income = sum(r[1] for r in rows if r[0] == "income")
     expense = sum(r[1] for r in rows if r[0] == "expense")
-    return {"period_label": label, "income": income or 0.0, "expense": expense or 0.0, "data": rows}
+    balance = start_balance + (income or 0) - (expense or 0)
+
+    return {
+        "period_label": label,
+        "income": income or 0.0,
+        "expense": expense or 0.0,
+        "balance": balance,
+        "start_balance": start_balance,
+        "data": rows
+    }
 
 @app.get("/api/records")
 async def api_records(user_id: int):
