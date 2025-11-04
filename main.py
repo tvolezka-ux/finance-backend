@@ -22,7 +22,6 @@ if not BOT_TOKEN:
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Таблица операций
     c.execute("""
         CREATE TABLE IF NOT EXISTS finance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -34,12 +33,17 @@ def init_db():
             created_at TEXT
         );
     """)
-    # Таблица настроек пользователя
     c.execute("""
         CREATE TABLE IF NOT EXISTS user_settings (
             user_id INTEGER PRIMARY KEY,
             currency TEXT DEFAULT '₽',
             start_balance REAL DEFAULT 0
+        );
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT
         );
     """)
     conn.commit()
@@ -83,11 +87,13 @@ class AddRecordRequest(BaseModel):
 class UpdateRecordRequest(BaseModel):
     type: str
     amount: float
+    description: str = ""
+    category_id: int = None
 
 def get_conn():
     return sqlite3.connect(DB_PATH)
 
-# ====== Эндпоинты настроек пользователя ======
+# ====== Эндпоинты пользователя ======
 @app.post("/api/init_user")
 async def api_init_user(data: dict = Body(...)):
     user_id = data.get("user_id")
@@ -116,6 +122,25 @@ async def api_get_user(user_id: int):
         return {"currency": row[0], "start_balance": row[1]}
     return {"currency": "₽", "start_balance": 0}
 
+# ===== Категории =====
+@app.get("/api/categories")
+async def api_categories():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT id, name FROM categories")
+    rows = [{"id": r[0], "name": r[1]} for r in c.fetchall()]
+    conn.close()
+    return rows
+
+@app.post("/api/add_category")
+async def api_add_category(name: str = Body(..., embed=True)):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("INSERT INTO categories (name) VALUES (?)", (name,))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
 # ===== Добавить операцию =====
 @app.post("/api/add")
 async def api_add(record: AddRecordRequest):
@@ -129,33 +154,46 @@ async def api_add(record: AddRecordRequest):
     conn.commit()
     conn.close()
 
-    asyncio.create_task(send_message_to_user(record.user_id, f"✅ Добавлено: {record.type} {record.amount}"))
+    asyncio.create_task(send_message_to_user(record.user_id, f"✅ {record.type.capitalize()} {record.amount}"))
     return {"status": "ok"}
 
 # ===== Список операций =====
-@app.get("/api/operations")
-async def get_operations(user_id: int):
+@app.get("/api/records")
+async def api_records(user_id: int):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        SELECT id, type, amount, created_at
-        FROM finance
-        WHERE user_id = ?
-        ORDER BY datetime(created_at) DESC
+        SELECT f.id, f.type, f.amount, f.description, f.category_id, f.created_at, c.name
+        FROM finance f
+        LEFT JOIN categories c ON f.category_id = c.id
+        WHERE f.user_id = ?
+        ORDER BY datetime(f.created_at) DESC LIMIT 50
     """, (user_id,))
-    rows = [{"id": r[0], "type": r[1], "amount": r[2], "created_at": r[3]} for r in c.fetchall()]
+    rows = [{
+        "id": r[0],
+        "type": r[1],
+        "amount": r[2],
+        "description": r[3],
+        "category_id": r[4],
+        "created_at": r[5],
+        "category_name": r[6]
+    } for r in c.fetchall()]
     conn.close()
     return rows
 
 # ===== Обновить операцию =====
-@app.put("/api/operations/{record_id}")
-async def update_operation(record_id: int, data: UpdateRecordRequest):
+@app.put("/api/update/{record_id}")
+async def api_update(record_id: int, data: UpdateRecordRequest):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("UPDATE finance SET type = ?, amount = ? WHERE id = ?", (data.type, data.amount, record_id))
+    c.execute("""
+        UPDATE finance
+        SET type = ?, amount = ?, description = ?, category_id = ?
+        WHERE id = ?
+    """, (data.type, data.amount, data.description, data.category_id, record_id))
     conn.commit()
     conn.close()
-    return {"success": True}
+    return {"status": "ok"}
 
 # ===== Отчёты =====
 @app.get("/api/report")
@@ -166,14 +204,14 @@ async def api_report(period: str = "day", user_id: int = None):
         label = now.strftime("%d.%m.%Y")
     elif period == "week":
         start = now - timedelta(days=7)
-        label = f"{(now - timedelta(days=7)).strftime('%d.%m.%Y')} — {now.strftime('%d.%m.%Y')}"
+        label = f"{(now - timedelta(days=7)).strftime('%d.%m')} — {now.strftime('%d.%m')}"
     elif period == "month":
         start = now - timedelta(days=30)
-        label = f"{(now - timedelta(days=30)).strftime('%d.%m.%Y')} — {now.strftime('%d.%m.%Y')}"
+        label = f"{(now - timedelta(days=30)).strftime('%d.%m')} — {now.strftime('%d.%m')}"
     else:
         start = now - timedelta(days=365)
         label = f"{(now - timedelta(days=365)).strftime('%d.%m.%Y')} — {now.strftime('%d.%m.%Y')}"
-    
+
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
@@ -184,49 +222,28 @@ async def api_report(period: str = "day", user_id: int = None):
     """, (user_id, start.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")))
     rows = c.fetchall()
 
-    # Получаем стартовый баланс пользователя
+    income = sum(r[1] for r in rows if r[0] == "income")
+    expense = sum(r[1] for r in rows if r[0] == "expense")
+
     c.execute("SELECT start_balance FROM user_settings WHERE user_id = ?", (user_id,))
-    start_balance_row = c.fetchone()
-    start_balance = start_balance_row[0] if start_balance_row else 0
+    start_balance = c.fetchone()[0] or 0
 
     conn.close()
 
-    income = sum(r[1] for r in rows if r[0] == "income")
-    expense = sum(r[1] for r in rows if r[0] == "expense")
-    balance = start_balance + (income or 0) - (expense or 0)
+    current_balance = start_balance + (income or 0) - (expense or 0)
 
     return {
         "period_label": label,
         "income": income or 0.0,
         "expense": expense or 0.0,
-        "balance": balance,
-        "start_balance": start_balance,
-        "data": rows
+        "balance": current_balance,
+        "start_balance": start_balance
     }
-
-@app.get("/api/records")
-async def api_records(user_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT id, type, amount, created_at FROM finance WHERE user_id = ? ORDER BY datetime(created_at) DESC LIMIT 50", (user_id,))
-    rows = [{"id": r[0], "type": r[1], "amount": r[2], "created_at": r[3]} for r in c.fetchall()]
-    conn.close()
-    return rows
-
-@app.put("/api/update/{record_id}")
-async def api_update(record_id: int, data: dict):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE finance SET amount = ? WHERE id = ?", (data["amount"], record_id))
-    conn.commit()
-    conn.close()
-    return {"status": "ok"}
 
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
 
-# ===== Запуск =====
 if __name__ == "__main__":
     import uvicorn
     loop = asyncio.get_event_loop()
