@@ -6,14 +6,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI
 import asyncio
-
-
 from aiogram import Bot, Dispatcher, types
 
 load_dotenv()
-
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "https://frontend-nine-phi-39.vercel.app/")
@@ -26,16 +22,6 @@ if not BOT_TOKEN:
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS user_settings (
-        user_id INTEGER PRIMARY KEY,
-        currency TEXT,
-        start_balance REAL
-    );""")
-    c.execute("""CREATE TABLE IF NOT EXISTS categories (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        type TEXT
-    );""")
     c.execute("""CREATE TABLE IF NOT EXISTS finance (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -45,20 +31,6 @@ def init_db():
         category_id INTEGER,
         created_at TEXT
     );""")
-    # default categories
-    c.execute("SELECT COUNT(*) FROM categories")
-    if c.fetchone()[0] == 0:
-        default_categories = [
-            ("Зарплата", "income"),
-            ("Подарки", "income"),
-            ("Прочее", "income"),
-            ("Еда", "expense"),
-            ("Транспорт", "expense"),
-            ("Жильё", "expense"),
-            ("Развлечения", "expense"),
-            ("Прочее", "expense"),
-        ]
-        c.executemany("INSERT INTO categories (name, type) VALUES (?, ?)", default_categories)
     conn.commit()
     conn.close()
 
@@ -82,45 +54,69 @@ async def send_message_to_user(user_id: int, text: str):
 
 # ===================== FastAPI =====================
 app = FastAPI()
-origins = [
-    "https://frontend-nine-phi-39.vercel.app",  # твой фронт
-]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,          # Разрешённые источники
+    allow_origins=["https://frontend-nine-phi-39.vercel.app"],
     allow_credentials=True,
-    allow_methods=["*"],            # Разрешаем все методы (GET, POST, OPTIONS и т.п.)
-    allow_headers=["*"],            # Разрешаем все заголовки
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 class AddRecordRequest(BaseModel):
-    init_data: str = None
-    user_id: int = None
+    user_id: int
     type: str
     amount: float
     description: str = ""
     category_id: int = None
 
+class UpdateRecordRequest(BaseModel):
+    type: str
+    amount: float
+
 def get_conn():
     return sqlite3.connect(DB_PATH)
 
+# ===== Добавить операцию =====
 @app.post("/api/add")
 async def api_add(record: AddRecordRequest):
-    user_id = record.user_id or None
     conn = get_conn()
     c = conn.cursor()
-    c.execute(
-        "INSERT INTO finance (user_id, type, amount, description, category_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (user_id, record.type, record.amount, record.description, record.category_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    )
+    c.execute("""
+        INSERT INTO finance (user_id, type, amount, description, category_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (record.user_id, record.type, record.amount, record.description, record.category_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
     conn.close()
 
-    if user_id:
-        asyncio.create_task(send_message_to_user(user_id, f"✅ Запись добавлена: {record.type} {record.amount}"))
-
+    asyncio.create_task(send_message_to_user(record.user_id, f"✅ Добавлено: {record.type} {record.amount}"))
     return {"status": "ok"}
 
+# ===== Список операций =====
+@app.get("/api/operations")
+async def get_operations(user_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, type, amount, created_at
+        FROM finance
+        WHERE user_id = ?
+        ORDER BY datetime(created_at) DESC
+    """, (user_id,))
+    rows = [{"id": r[0], "type": r[1], "amount": r[2], "created_at": r[3]} for r in c.fetchall()]
+    conn.close()
+    return rows
+
+# ===== Обновить операцию =====
+@app.put("/api/operations/{record_id}")
+async def update_operation(record_id: int, data: UpdateRecordRequest):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE finance SET type = ?, amount = ? WHERE id = ?", (data.type, data.amount, record_id))
+    conn.commit()
+    conn.close()
+    return {"success": True}
+
+# ===== Отчёты =====
 @app.get("/api/report")
 async def api_report(period: str = "day", user_id: int = None):
     now = datetime.now()
@@ -133,20 +129,18 @@ async def api_report(period: str = "day", user_id: int = None):
     elif period == "month":
         start = now - timedelta(days=30)
         label = f"{(now - timedelta(days=30)).strftime('%d.%m.%Y')} — {now.strftime('%d.%m.%Y')}"
-    elif period == "year":
+    else:
         start = now - timedelta(days=365)
         label = f"{(now - timedelta(days=365)).strftime('%d.%m.%Y')} — {now.strftime('%d.%m.%Y')}"
-    else:
-        raise HTTPException(status_code=400, detail="unknown period")
 
     conn = get_conn()
     c = conn.cursor()
-    if user_id:
-        c.execute("SELECT type, SUM(amount) FROM finance WHERE user_id = ? AND datetime(created_at) BETWEEN ? AND ? GROUP BY type",
-                  (user_id, start.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")))
-    else:
-        c.execute("SELECT type, SUM(amount) FROM finance WHERE datetime(created_at) BETWEEN ? AND ? GROUP BY type",
-                  (start.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")))
+    c.execute("""
+        SELECT type, SUM(amount)
+        FROM finance
+        WHERE user_id = ? AND datetime(created_at) BETWEEN ? AND ?
+        GROUP BY type
+    """, (user_id, start.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")))
     rows = c.fetchall()
     conn.close()
 
@@ -158,9 +152,9 @@ async def api_report(period: str = "day", user_id: int = None):
 async def health():
     return {"status": "ok"}
 
-# ===================== Запуск =====================
+# ===== Запуск =====
 if __name__ == "__main__":
     import uvicorn
     loop = asyncio.get_event_loop()
-    loop.create_task(dp.start_polling())  # запускаем бот
-    uvicorn.run(app, host="0.0.0.0", port=8000)  # запускаем FastAPI
+    loop.create_task(dp.start_polling())
+    uvicorn.run(app, host="0.0.0.0", port=8000)
