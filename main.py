@@ -8,23 +8,45 @@ from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 from aiogram import Bot, Dispatcher, types
 import psycopg2
+from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "https://frontend-nine-phi-39.vercel.app/")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://finance_db_zrvy_user:p7ltpFIAhntlJwV6hpzElONWb5xWmrec@dpg-d45hl5be5dus73c5cev0-a/finance_db_zrvy")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://finance_db_zrvy_user:p7ltpFIAhntlJwV6hpzElONWb5xWmrec@dpg-d45hl5be5dus73c5cev0-a/finance_db_zrvy"
+)
 
 if not BOT_TOKEN:
     raise RuntimeError("Set BOT_TOKEN in .env")
 
-# ===================== База данных =====================
-def get_conn():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+# ===================== Пул подключений =====================
+db_pool = None
 
+def init_connection_pool():
+    global db_pool
+    if db_pool is None:
+        db_pool = pool.SimpleConnectionPool(
+            1, 10,  # min/max соединений
+            dsn=DATABASE_URL,
+            cursor_factory=RealDictCursor
+        )
+
+def get_db_connection():
+    if db_pool is None:
+        init_connection_pool()
+    return db_pool.getconn()
+
+def release_db_connection(conn):
+    if db_pool:
+        db_pool.putconn(conn)
+
+# ===================== База данных =====================
 def init_db():
-    conn = get_conn()
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS finance (
@@ -52,8 +74,9 @@ def init_db():
     """)
     conn.commit()
     c.close()
-    conn.close()
+    release_db_connection(conn)
 
+init_connection_pool()
 init_db()
 
 # ===================== aiogram =====================
@@ -102,26 +125,27 @@ async def api_init_user(data: dict = Body(...)):
     currency = data.get("currency", "₽")
     start_balance = float(data.get("start_balance", 0))
 
-    conn = get_conn()
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         INSERT INTO user_settings (user_id, currency, start_balance)
         VALUES (%s, %s, %s)
-        ON CONFLICT (user_id) DO UPDATE SET currency = EXCLUDED.currency, start_balance = EXCLUDED.start_balance
+        ON CONFLICT (user_id) DO UPDATE
+        SET currency = EXCLUDED.currency, start_balance = EXCLUDED.start_balance
     """, (user_id, currency, start_balance))
     conn.commit()
     c.close()
-    conn.close()
+    release_db_connection(conn)
     return {"status": "ok"}
 
 @app.get("/api/get_user")
 async def api_get_user(user_id: int):
-    conn = get_conn()
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT currency, start_balance FROM user_settings WHERE user_id = %s", (user_id,))
     row = c.fetchone()
     c.close()
-    conn.close()
+    release_db_connection(conn)
     if row:
         return {"currency": row["currency"], "start_balance": row["start_balance"]}
     return {"currency": "₽", "start_balance": 0}
@@ -129,37 +153,37 @@ async def api_get_user(user_id: int):
 # ===== Категории =====
 @app.get("/api/categories")
 async def api_categories():
-    conn = get_conn()
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT id, name FROM categories")
     rows = c.fetchall()
     c.close()
-    conn.close()
+    release_db_connection(conn)
     return [{"id": r["id"], "name": r["name"]} for r in rows]
 
 @app.post("/api/add_category")
 async def api_add_category(name: str = Body(..., embed=True)):
-    conn = get_conn()
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("INSERT INTO categories (name) VALUES (%s)", (name,))
     conn.commit()
     c.close()
-    conn.close()
+    release_db_connection(conn)
     return {"status": "ok"}
 
 # ===== Добавить операцию =====
 @app.post("/api/add")
 async def api_add(record: AddRecordRequest):
-    conn = get_conn()
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         INSERT INTO finance (user_id, type, amount, description, category_id, created_at)
         VALUES (%s, %s, %s, %s, %s, %s)
-    """, (record.user_id, record.type, record.amount, record.description, record.category_id,
-          datetime.now()))
+    """, (record.user_id, record.type, record.amount, record.description,
+          record.category_id, datetime.now()))
     conn.commit()
     c.close()
-    conn.close()
+    release_db_connection(conn)
 
     asyncio.create_task(send_message_to_user(record.user_id, f"✅ {record.type.capitalize()} {record.amount}"))
     return {"status": "ok"}
@@ -167,7 +191,7 @@ async def api_add(record: AddRecordRequest):
 # ===== Список операций =====
 @app.get("/api/records")
 async def api_records(user_id: int):
-    conn = get_conn()
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         SELECT f.id, f.type, f.amount, f.description, f.category_id, f.created_at, c.name AS category_name
@@ -178,13 +202,13 @@ async def api_records(user_id: int):
     """, (user_id,))
     rows = c.fetchall()
     c.close()
-    conn.close()
+    release_db_connection(conn)
     return rows
 
 # ===== Обновить операцию =====
 @app.put("/api/update/{record_id}")
 async def api_update(record_id: int, data: UpdateRecordRequest):
-    conn = get_conn()
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         UPDATE finance
@@ -193,7 +217,7 @@ async def api_update(record_id: int, data: UpdateRecordRequest):
     """, (data.type, data.amount, data.description, data.category_id, record_id))
     conn.commit()
     c.close()
-    conn.close()
+    release_db_connection(conn)
     return {"status": "ok"}
 
 # ===== Отчёты =====
@@ -213,7 +237,7 @@ async def api_report(period: str = "day", user_id: int = None):
         start = now - timedelta(days=365)
         label = f"{(now - timedelta(days=365)).strftime('%d.%m.%Y')} — {now.strftime('%d.%m.%Y')}"
 
-    conn = get_conn()
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         SELECT type, SUM(amount) AS total
@@ -233,7 +257,7 @@ async def api_report(period: str = "day", user_id: int = None):
     current_balance = start_balance + (income or 0) - (expense or 0)
 
     c.close()
-    conn.close()
+    release_db_connection(conn)
 
     return {
         "period_label": label,
