@@ -3,3 +3,4 @@ uvicorn[standard]
 aiogram==2.25.1
 python-dotenv
 pydantic
+psycopg2-binary
