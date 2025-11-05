@@ -1,6 +1,5 @@
 # backend/main.py
 import os
-import sqlite3
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
@@ -8,45 +7,51 @@ from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 from aiogram import Bot, Dispatcher, types
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "https://frontend-nine-phi-39.vercel.app/")
-DB_PATH = "finance.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://finance_db_zrvy_user:p7ltpFIAhntlJwV6hpzElONWb5xWmrec@dpg-d45hl5be5dus73c5cev0-a/finance_db_zrvy")
 
 if not BOT_TOKEN:
     raise RuntimeError("Set BOT_TOKEN in .env")
 
 # ===================== База данных =====================
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS finance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
             type TEXT,
             amount REAL,
             description TEXT,
             category_id INTEGER,
-            created_at TEXT
+            created_at TIMESTAMP
         );
     """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS user_settings (
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             currency TEXT DEFAULT '₽',
             start_balance REAL DEFAULT 0
         );
     """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS categories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             name TEXT
         );
     """)
     conn.commit()
+    c.close()
     conn.close()
 
 init_db()
@@ -90,9 +95,6 @@ class UpdateRecordRequest(BaseModel):
     description: str = ""
     category_id: int = None
 
-def get_conn():
-    return sqlite3.connect(DB_PATH)
-
 # ====== Эндпоинты пользователя ======
 @app.post("/api/init_user")
 async def api_init_user(data: dict = Body(...)):
@@ -103,23 +105,25 @@ async def api_init_user(data: dict = Body(...)):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        INSERT OR REPLACE INTO user_settings (user_id, currency, start_balance)
-        VALUES (?, ?, ?)
+        INSERT INTO user_settings (user_id, currency, start_balance)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET currency = EXCLUDED.currency, start_balance = EXCLUDED.start_balance
     """, (user_id, currency, start_balance))
     conn.commit()
+    c.close()
     conn.close()
     return {"status": "ok"}
-
 
 @app.get("/api/get_user")
 async def api_get_user(user_id: int):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT currency, start_balance FROM user_settings WHERE user_id = ?", (user_id,))
+    c.execute("SELECT currency, start_balance FROM user_settings WHERE user_id = %s", (user_id,))
     row = c.fetchone()
+    c.close()
     conn.close()
     if row:
-        return {"currency": row[0], "start_balance": row[1]}
+        return {"currency": row["currency"], "start_balance": row["start_balance"]}
     return {"currency": "₽", "start_balance": 0}
 
 # ===== Категории =====
@@ -128,16 +132,18 @@ async def api_categories():
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT id, name FROM categories")
-    rows = [{"id": r[0], "name": r[1]} for r in c.fetchall()]
+    rows = c.fetchall()
+    c.close()
     conn.close()
-    return rows
+    return [{"id": r["id"], "name": r["name"]} for r in rows]
 
 @app.post("/api/add_category")
 async def api_add_category(name: str = Body(..., embed=True)):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("INSERT INTO categories (name) VALUES (?)", (name,))
+    c.execute("INSERT INTO categories (name) VALUES (%s)", (name,))
     conn.commit()
+    c.close()
     conn.close()
     return {"status": "ok"}
 
@@ -148,10 +154,11 @@ async def api_add(record: AddRecordRequest):
     c = conn.cursor()
     c.execute("""
         INSERT INTO finance (user_id, type, amount, description, category_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s)
     """, (record.user_id, record.type, record.amount, record.description, record.category_id,
-          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+          datetime.now()))
     conn.commit()
+    c.close()
     conn.close()
 
     asyncio.create_task(send_message_to_user(record.user_id, f"✅ {record.type.capitalize()} {record.amount}"))
@@ -163,21 +170,14 @@ async def api_records(user_id: int):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        SELECT f.id, f.type, f.amount, f.description, f.category_id, f.created_at, c.name
+        SELECT f.id, f.type, f.amount, f.description, f.category_id, f.created_at, c.name AS category_name
         FROM finance f
         LEFT JOIN categories c ON f.category_id = c.id
-        WHERE f.user_id = ?
-        ORDER BY datetime(f.created_at) DESC LIMIT 50
+        WHERE f.user_id = %s
+        ORDER BY f.created_at DESC LIMIT 50
     """, (user_id,))
-    rows = [{
-        "id": r[0],
-        "type": r[1],
-        "amount": r[2],
-        "description": r[3],
-        "category_id": r[4],
-        "created_at": r[5],
-        "category_name": r[6]
-    } for r in c.fetchall()]
+    rows = c.fetchall()
+    c.close()
     conn.close()
     return rows
 
@@ -188,10 +188,11 @@ async def api_update(record_id: int, data: UpdateRecordRequest):
     c = conn.cursor()
     c.execute("""
         UPDATE finance
-        SET type = ?, amount = ?, description = ?, category_id = ?
-        WHERE id = ?
+        SET type = %s, amount = %s, description = %s, category_id = %s
+        WHERE id = %s
     """, (data.type, data.amount, data.description, data.category_id, record_id))
     conn.commit()
+    c.close()
     conn.close()
     return {"status": "ok"}
 
@@ -215,22 +216,24 @@ async def api_report(period: str = "day", user_id: int = None):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        SELECT type, SUM(amount)
+        SELECT type, SUM(amount) AS total
         FROM finance
-        WHERE user_id = ? AND datetime(created_at) BETWEEN ? AND ?
+        WHERE user_id = %s AND created_at BETWEEN %s AND %s
         GROUP BY type
-    """, (user_id, start.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")))
+    """, (user_id, start, now))
     rows = c.fetchall()
 
-    income = sum(r[1] for r in rows if r[0] == "income")
-    expense = sum(r[1] for r in rows if r[0] == "expense")
+    income = sum(r["total"] for r in rows if r["type"] == "income")
+    expense = sum(r["total"] for r in rows if r["type"] == "expense")
 
-    c.execute("SELECT start_balance FROM user_settings WHERE user_id = ?", (user_id,))
-    start_balance = c.fetchone()[0] or 0
-
-    conn.close()
+    c.execute("SELECT start_balance FROM user_settings WHERE user_id = %s", (user_id,))
+    row = c.fetchone()
+    start_balance = row["start_balance"] if row else 0
 
     current_balance = start_balance + (income or 0) - (expense or 0)
+
+    c.close()
+    conn.close()
 
     return {
         "period_label": label,
